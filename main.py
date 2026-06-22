@@ -11,6 +11,7 @@ from functools import lru_cache
 from io import BytesIO
 from typing import Any, Generator, Optional
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -26,6 +27,9 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("mewshifts-import")
+
+# Load .env for local development (Railway injects env vars directly).
+load_dotenv()
 
 
 # =============================================================================

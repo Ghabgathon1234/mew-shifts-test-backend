@@ -8,8 +8,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from dotenv import load_dotenv
 from openai import OpenAI
 
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,11 +19,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mewshifts-local")
 
-import os
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY environment variable is missing.")
+    raise RuntimeError(
+        "OPENAI_API_KEY is missing. Copy .env.example to .env and set your key."
+    )
 
 client = OpenAI(
     api_key=OPENAI_API_KEY,
