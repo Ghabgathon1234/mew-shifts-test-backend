@@ -17,7 +17,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mewshifts-local")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = "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"
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY environment variable is missing.")
 

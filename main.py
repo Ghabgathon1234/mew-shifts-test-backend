@@ -4,14 +4,16 @@ import json
 import logging
 import os
 import re
+import threading
 import traceback
 from datetime import datetime
 from functools import lru_cache
 from io import BytesIO
-from typing import Any, Optional
+from typing import Any, Generator, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from openai import OpenAI
 
 
@@ -643,10 +645,23 @@ def parse_pdf_document(
     system_prompt: str,
     filename: str,
 ) -> dict:
+    """Non-streaming wrapper around [parse_pdf_document_stream]."""
+    for event in parse_pdf_document_stream(
+        client, file_bytes, system_prompt, filename
+    ):
+        if event.get("event") == "done":
+            return {"days": event.get("days", [])}
+    raise ValueError("PDF parse produced no result")
+
+
+def parse_pdf_document_stream(
+    client: OpenAI,
+    file_bytes: bytes,
+    system_prompt: str,
+    filename: str,
+) -> Generator[dict, None, None]:
     """
-    Parse any PDF: digital text tables, scanned pages, or mixed layouts.
-    Uses text extraction per page when available, vision per page otherwise,
-    then whole-file upload as a last resort.
+    Parse any PDF page-by-page, yielding NDJSON progress events between pages.
     """
     page_texts = extract_pdf_page_texts(file_bytes)
     total_pages = len(page_texts)
@@ -654,6 +669,7 @@ def parse_pdf_document(
         raise ValueError("PDF has no pages")
 
     logger.info("Parsing PDF (%s pages) with hybrid text/vision pipeline", total_pages)
+    yield {"event": "start", "total_pages": total_pages}
 
     combined_by_date: dict[str, dict] = {}
     text_pages_parsed = 0
@@ -667,6 +683,7 @@ def parse_pdf_document(
             + PAGE_CHUNK_SUFFIX
             + f"\n(This chunk is page {page_num} of {total_pages}.)"
         )
+        chunk_days = 0
 
         if len(text) >= MIN_PAGE_TEXT_CHARS:
             try:
@@ -675,14 +692,22 @@ def parse_pdf_document(
                     chunk_prompt,
                     page_header + text,
                 )
+                chunk_days = len(chunk_result.get("days", []))
                 merge_chunk_days(combined_by_date, chunk_result)
                 text_pages_parsed += 1
                 logger.info(
                     "PDF page %s text: chunk_days=%s total_unique=%s",
                     page_num,
-                    len(chunk_result.get("days", [])),
+                    chunk_days,
                     len(combined_by_date),
                 )
+                yield {
+                    "event": "page",
+                    "page": page_num,
+                    "total_pages": total_pages,
+                    "chunk_days": chunk_days,
+                    "total_days": len(combined_by_date),
+                }
                 continue
             except Exception as e:
                 logger.warning(
@@ -697,16 +722,32 @@ def parse_pdf_document(
                 png_bytes,
                 chunk_prompt,
             )
+            chunk_days = len(chunk_result.get("days", []))
             merge_chunk_days(combined_by_date, chunk_result)
             vision_pages_parsed += 1
             logger.info(
                 "PDF page %s vision: chunk_days=%s total_unique=%s",
                 page_num,
-                len(chunk_result.get("days", [])),
+                chunk_days,
                 len(combined_by_date),
             )
+            yield {
+                "event": "page",
+                "page": page_num,
+                "total_pages": total_pages,
+                "chunk_days": chunk_days,
+                "total_days": len(combined_by_date),
+            }
         except Exception as e:
             logger.warning("PDF page %s vision parse failed: %s", page_num, e)
+            yield {
+                "event": "page",
+                "page": page_num,
+                "total_pages": total_pages,
+                "chunk_days": 0,
+                "total_days": len(combined_by_date),
+                "warning": str(e),
+            }
 
     if combined_by_date:
         normalized_days = sorted(combined_by_date.values(), key=lambda x: x["date"])
@@ -716,12 +757,17 @@ def parse_pdf_document(
             text_pages_parsed,
             vision_pages_parsed,
         )
-        return {"days": normalized_days}
+        yield {"event": "done", "days": normalized_days}
+        return
 
     logger.warning("PDF hybrid parse found no rows; falling back to whole-file upload")
     file_id = upload_file_to_openai(client, filename, file_bytes)
     try:
-        return ask_openai_to_parse_file(client, file_id, system_prompt)
+        result = ask_openai_to_parse_file(client, file_id, system_prompt)
+        yield {
+            "event": "done",
+            "days": result.get("days", []),
+        }
     finally:
         delete_openai_file(client, file_id)
 
@@ -868,6 +914,40 @@ def resolve_prompt_builder(filename: str, mode: str):
     return build_system_prompt
 
 
+def run_import_pipeline_stream(
+    filename: str,
+    file_bytes: bytes,
+    shift_pattern_json: Optional[str] = None,
+    has_presence_check: bool = False,
+    mode: str = "import",
+) -> Generator[dict, None, None]:
+    """Yield NDJSON events while parsing (page progress for PDFs)."""
+    client = get_openai_client()
+    prompt_builder = resolve_prompt_builder(filename, mode)
+    system_prompt = prompt_builder(shift_pattern_json, has_presence_check)
+
+    if is_image_filename(filename):
+        result = ask_openai_to_parse_image(client, filename, file_bytes, system_prompt)
+        yield {"event": "done", "days": result.get("days", [])}
+        return
+
+    lowered = filename.lower()
+    if lowered.endswith(".pdf"):
+        for event in parse_pdf_document_stream(
+            client, file_bytes, system_prompt, filename
+        ):
+            yield event
+        return
+
+    file_id: Optional[str] = None
+    try:
+        file_id = upload_file_to_openai(client, filename, file_bytes)
+        result = ask_openai_to_parse_file(client, file_id, system_prompt)
+        yield {"event": "done", "days": result.get("days", [])}
+    finally:
+        delete_openai_file(client, file_id)
+
+
 def run_import_pipeline(
     filename: str,
     file_bytes: bytes,
@@ -933,7 +1013,8 @@ async def import_attendance(
     shift_pattern: Optional[str] = Form(None),
     has_presence_check: Optional[str] = Form(None),
     mode: Optional[str] = Form("import"),
-) -> dict:
+    stream: Optional[str] = Form("true"),
+) -> Any:
     logger.info("POST /import-attendance called")
 
     filename = (file.filename or "").strip()
@@ -942,12 +1023,13 @@ async def import_attendance(
     request_mode = (mode or "import").strip().lower()
     if request_mode not in {"import", "insert"}:
         request_mode = "import"
+    use_stream = stream not in ("false", "0", "no")
 
     allowed_extensions = INSERT_ALLOWED_EXTENSIONS if request_mode == "insert" else ALLOWED_EXTENSIONS
 
     logger.info(
-        "Incoming filename: %s  mode: %s  shift_pattern_present: %s  presence_check: %s",
-        filename, request_mode, shift_pattern is not None, presence_check,
+        "Incoming filename: %s  mode: %s  stream: %s  shift_pattern_present: %s  presence_check: %s",
+        filename, request_mode, use_stream, shift_pattern is not None, presence_check,
     )
 
     if not filename:
@@ -989,6 +1071,52 @@ async def import_attendance(
     logger.info("Waiting for semaphore slot...")
     async with IMPORT_SEMAPHORE:
         logger.info("Semaphore acquired for filename=%s", filename)
+
+        if use_stream:
+            loop = asyncio.get_running_loop()
+            event_queue: asyncio.Queue = asyncio.Queue()
+
+            def worker() -> None:
+                try:
+                    for event in run_import_pipeline_stream(
+                        filename,
+                        file_bytes,
+                        shift_pattern,
+                        presence_check,
+                        request_mode,
+                    ):
+                        loop.call_soon_threadsafe(event_queue.put_nowait, event)
+                except Exception as e:
+                    logger.error("Stream import worker failed: %s", e)
+                    loop.call_soon_threadsafe(
+                        event_queue.put_nowait,
+                        {"event": "error", "detail": str(e)},
+                    )
+                finally:
+                    loop.call_soon_threadsafe(event_queue.put_nowait, None)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+            async def ndjson_generator():
+                try:
+                    while True:
+                        event = await event_queue.get()
+                        if event is None:
+                            break
+                        if event.get("event") == "done":
+                            logger.info(
+                                "Import stream complete for filename=%s | days_count=%s",
+                                filename,
+                                len(event.get("days", [])),
+                            )
+                        yield json.dumps(event, ensure_ascii=False) + "\n"
+                finally:
+                    logger.info("Import request finished for filename=%s", filename)
+
+            return StreamingResponse(
+                ndjson_generator(),
+                media_type="application/x-ndjson",
+            )
 
         try:
             parsed = await asyncio.to_thread(
