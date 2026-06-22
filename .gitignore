@@ -1,6 +1,0 @@
-.env
-api.txt
-__pycache__/
-*.pyc
-.venv/
-venv/

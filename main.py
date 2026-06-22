@@ -56,7 +56,6 @@ ALLOWED_PERMISSION_TIMES = {"shift start", "shift end", "during shift"}
 ALLOWED_STATUSES = {"onDuty", "Vacation", "Sick Leave", "Casual Leave", "Training Course", "Other"}
 ALLOWED_SHIFTS = {"day", "night"}
 MAX_OUTPUT_TOKENS = 32768
-MIN_PAGE_TEXT_CHARS = 20
 PDF_RENDER_DPI = 150
 
 PAGE_CHUNK_SUFFIX = (
@@ -564,51 +563,6 @@ def build_insert_prompt(
     )
 
 
-def ask_openai_to_parse_text(client: OpenAI, system_prompt: str, document_text: str) -> dict:
-    logger.info("Sending text chunk to OpenAI (%s chars)...", len(document_text))
-
-    try:
-        response = client.responses.create(
-            model="gpt-4.1-mini",
-            max_output_tokens=MAX_OUTPUT_TOKENS,
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": system_prompt,
-                        },
-                        {
-                            "type": "input_text",
-                            "text": "DOCUMENT TEXT:\n" + document_text,
-                        },
-                    ],
-                }
-            ],
-        )
-    except Exception as e:
-        logger.error("OpenAI text request failed: %s", repr(e))
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"OpenAI request failed: {repr(e)}")
-
-    raw_output = response.output_text or ""
-    logger.info("OpenAI text output chars: %s", len(raw_output))
-
-    if not raw_output.strip():
-        raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
-
-    json_text = extract_json_text(raw_output)
-
-    try:
-        parsed = json.loads(json_text)
-    except Exception as e:
-        logger.error("Model returned invalid JSON: %s", str(e))
-        raise HTTPException(status_code=500, detail=f"Model returned invalid JSON: {str(e)}")
-
-    return validate_and_normalize_model_output(parsed)
-
-
 def merge_chunk_days(combined_by_date: dict[str, dict], chunk_result: dict) -> None:
     for day in chunk_result.get("days", []):
         date_value = day.get("date")
@@ -622,17 +576,28 @@ def merge_chunk_days(combined_by_date: dict[str, dict], chunk_result: dict) -> N
             combined_by_date[date_value] = day
 
 
-def extract_pdf_page_texts(file_bytes: bytes) -> list[str]:
-    from pypdf import PdfReader
+def count_pdf_pages(file_bytes: bytes) -> int:
+    import fitz
 
-    reader = PdfReader(BytesIO(file_bytes))
-    texts: list[str] = []
-    for page in reader.pages:
-        texts.append((page.extract_text() or "").strip())
-    return texts
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    return doc.page_count
+
+
+def extract_single_page_pdf(file_bytes: bytes, page_index: int) -> bytes:
+    """Build a one-page PDF from a multi-page document (no text extraction)."""
+    import fitz
+
+    src = fitz.open(stream=file_bytes, filetype="pdf")
+    if page_index < 0 or page_index >= src.page_count:
+        raise IndexError(f"PDF page index out of range: {page_index}")
+
+    dst = fitz.open()
+    dst.insert_pdf(src, from_page=page_index, to_page=page_index)
+    return dst.tobytes()
 
 
 def render_pdf_page_png(file_bytes: bytes, page_index: int, dpi: int = PDF_RENDER_DPI) -> bytes:
+    """Fallback when single-page PDF upload fails (scanned/low-quality pages)."""
     import fitz
 
     doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -641,6 +606,21 @@ def render_pdf_page_png(file_bytes: bytes, page_index: int, dpi: int = PDF_RENDE
     page = doc[page_index]
     pix = page.get_pixmap(dpi=dpi)
     return pix.tobytes("png")
+
+
+def ask_openai_to_parse_pdf_bytes(
+    client: OpenAI,
+    filename: str,
+    pdf_bytes: bytes,
+    system_prompt: str,
+) -> dict:
+    """Upload a (usually single-page) PDF to OpenAI and parse via vision/file input."""
+    file_id: Optional[str] = None
+    try:
+        file_id = upload_file_to_openai(client, filename, pdf_bytes)
+        return ask_openai_to_parse_file(client, file_id, system_prompt)
+    finally:
+        delete_openai_file(client, file_id)
 
 
 def parse_pdf_document(
@@ -665,106 +645,107 @@ def parse_pdf_document_stream(
     filename: str,
 ) -> Generator[dict, None, None]:
     """
-    Parse any PDF page-by-page, yielding NDJSON progress events between pages.
+    Parse PDFs page-by-page: each page is sent as its own PDF to OpenAI
+    (layout/vision) without local text extraction.
     """
-    page_texts = extract_pdf_page_texts(file_bytes)
-    total_pages = len(page_texts)
+    total_pages = count_pdf_pages(file_bytes)
     if total_pages == 0:
         raise ValueError("PDF has no pages")
 
-    logger.info("Parsing PDF (%s pages) with hybrid text/vision pipeline", total_pages)
+    logger.info(
+        "Parsing PDF (%s pages) — one OpenAI file per page (no text extraction)",
+        total_pages,
+    )
     yield {"event": "start", "total_pages": total_pages}
 
     combined_by_date: dict[str, dict] = {}
-    text_pages_parsed = 0
+    pdf_pages_parsed = 0
     vision_pages_parsed = 0
+    base_name = (filename or "document").rsplit(".", 1)[0]
 
-    for page_index, text in enumerate(page_texts):
+    for page_index in range(total_pages):
         page_num = page_index + 1
-        page_header = f"--- Page {page_num} of {total_pages} ---\n"
         chunk_prompt = (
             system_prompt
             + PAGE_CHUNK_SUFFIX
             + f"\n(This chunk is page {page_num} of {total_pages}.)"
         )
         chunk_days = 0
-
-        if len(text) >= MIN_PAGE_TEXT_CHARS:
-            try:
-                chunk_result = ask_openai_to_parse_text(
-                    client,
-                    chunk_prompt,
-                    page_header + text,
-                )
-                chunk_days = len(chunk_result.get("days", []))
-                merge_chunk_days(combined_by_date, chunk_result)
-                text_pages_parsed += 1
-                logger.info(
-                    "PDF page %s text: chunk_days=%s total_unique=%s",
-                    page_num,
-                    chunk_days,
-                    len(combined_by_date),
-                )
-                yield {
-                    "event": "page",
-                    "page": page_num,
-                    "total_pages": total_pages,
-                    "chunk_days": chunk_days,
-                    "total_days": len(combined_by_date),
-                }
-                continue
-            except Exception as e:
-                logger.warning(
-                    "PDF page %s text parse failed, trying vision: %s", page_num, e
-                )
+        parsed = False
 
         try:
-            png_bytes = render_pdf_page_png(file_bytes, page_index)
-            chunk_result = ask_openai_to_parse_image(
+            page_pdf = extract_single_page_pdf(file_bytes, page_index)
+            chunk_result = ask_openai_to_parse_pdf_bytes(
                 client,
-                f"{filename or 'document'}_page_{page_num}.png",
-                png_bytes,
+                f"{base_name}_page_{page_num}.pdf",
+                page_pdf,
                 chunk_prompt,
             )
             chunk_days = len(chunk_result.get("days", []))
             merge_chunk_days(combined_by_date, chunk_result)
-            vision_pages_parsed += 1
+            pdf_pages_parsed += 1
+            parsed = True
             logger.info(
-                "PDF page %s vision: chunk_days=%s total_unique=%s",
+                "PDF page %s file: chunk_days=%s total_unique=%s",
                 page_num,
                 chunk_days,
                 len(combined_by_date),
             )
-            yield {
-                "event": "page",
-                "page": page_num,
-                "total_pages": total_pages,
-                "chunk_days": chunk_days,
-                "total_days": len(combined_by_date),
-            }
         except Exception as e:
-            logger.warning("PDF page %s vision parse failed: %s", page_num, e)
-            yield {
-                "event": "page",
-                "page": page_num,
-                "total_pages": total_pages,
-                "chunk_days": 0,
-                "total_days": len(combined_by_date),
-                "warning": str(e),
-            }
+            logger.warning(
+                "PDF page %s file parse failed, trying page image: %s", page_num, e
+            )
+
+        if not parsed:
+            try:
+                png_bytes = render_pdf_page_png(file_bytes, page_index)
+                chunk_result = ask_openai_to_parse_image(
+                    client,
+                    f"{base_name}_page_{page_num}.png",
+                    png_bytes,
+                    chunk_prompt,
+                )
+                chunk_days = len(chunk_result.get("days", []))
+                merge_chunk_days(combined_by_date, chunk_result)
+                vision_pages_parsed += 1
+                logger.info(
+                    "PDF page %s image: chunk_days=%s total_unique=%s",
+                    page_num,
+                    chunk_days,
+                    len(combined_by_date),
+                )
+            except Exception as e:
+                logger.warning("PDF page %s image parse failed: %s", page_num, e)
+                yield {
+                    "event": "page",
+                    "page": page_num,
+                    "total_pages": total_pages,
+                    "chunk_days": 0,
+                    "total_days": len(combined_by_date),
+                    "warning": str(e),
+                }
+                continue
+
+        yield {
+            "event": "page",
+            "page": page_num,
+            "total_pages": total_pages,
+            "chunk_days": chunk_days,
+            "total_days": len(combined_by_date),
+        }
 
     if combined_by_date:
         normalized_days = sorted(combined_by_date.values(), key=lambda x: x["date"])
         logger.info(
-            "PDF hybrid parse complete: total_days=%s text_pages=%s vision_pages=%s",
+            "PDF page parse complete: total_days=%s pdf_pages=%s image_pages=%s",
             len(normalized_days),
-            text_pages_parsed,
+            pdf_pages_parsed,
             vision_pages_parsed,
         )
         yield {"event": "done", "days": normalized_days}
         return
 
-    logger.warning("PDF hybrid parse found no rows; falling back to whole-file upload")
+    logger.warning("PDF per-page parse found no rows; falling back to whole-file upload")
     file_id = upload_file_to_openai(client, filename, file_bytes)
     try:
         result = ask_openai_to_parse_file(client, file_id, system_prompt)
