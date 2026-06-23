@@ -6,3 +6,10 @@ startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
 healthcheckPath = "/health"
 healthcheckTimeout = 300
 restartPolicyType = "ON_FAILURE"
+
+# Railway dashboard (recommended with 8 vCPU / 8 GB per replica):
+#   Settings → Scaling → Replicas: 2 or 3  (public URL load-balances automatically)
+#   Settings → Variables:
+#     OPENAI_API_KEY=...
+#     MAX_PARALLEL_IMPORTS=2      # full imports per replica
+#     PDF_PAGE_PARALLELISM=4      # OpenAI calls in parallel per PDF

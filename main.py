@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from functools import lru_cache
 from io import BytesIO
@@ -47,7 +48,26 @@ app.add_middleware(
 )
 
 MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024
-IMPORT_SEMAPHORE = asyncio.Semaphore(2)
+
+
+def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 16) -> int:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        logger.warning("Invalid %s=%s — using default %s", name, raw, default)
+        return default
+    return max(minimum, min(maximum, value))
+
+
+# Concurrent full-file imports per replica (Railway LB spreads users across replicas).
+MAX_PARALLEL_IMPORTS = _env_int("MAX_PARALLEL_IMPORTS", 2, 1, 8)
+# OpenAI calls in parallel per PDF (biggest speed win for multi-page files).
+PDF_PAGE_PARALLELISM = _env_int("PDF_PAGE_PARALLELISM", 4, 1, 8)
+
+IMPORT_SEMAPHORE = asyncio.Semaphore(MAX_PARALLEL_IMPORTS)
 
 ALLOWED_EXTENSIONS = (".pdf", ".xls", ".xlsx")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif")
@@ -638,6 +658,67 @@ def parse_pdf_document(
     raise ValueError("PDF parse produced no result")
 
 
+def _parse_pdf_page_index(
+    client: OpenAI,
+    file_bytes: bytes,
+    system_prompt: str,
+    filename: str,
+    page_index: int,
+    total_pages: int,
+) -> dict[str, Any]:
+    """Parse one PDF page (single-page PDF upload, image fallback)."""
+    page_num = page_index + 1
+    base_name = (filename or "document").rsplit(".", 1)[0]
+    chunk_prompt = (
+        system_prompt
+        + PAGE_CHUNK_SUFFIX
+        + f"\n(This chunk is page {page_num} of {total_pages}.)"
+    )
+    result: dict[str, Any] = {
+        "page_num": page_num,
+        "chunk_days": 0,
+        "chunk_result": None,
+        "parse_method": None,
+        "warning": None,
+    }
+
+    try:
+        page_pdf = extract_single_page_pdf(file_bytes, page_index)
+        chunk_result = ask_openai_to_parse_pdf_bytes(
+            client,
+            f"{base_name}_page_{page_num}.pdf",
+            page_pdf,
+            chunk_prompt,
+        )
+        result["chunk_days"] = len(chunk_result.get("days", []))
+        result["chunk_result"] = chunk_result
+        result["parse_method"] = "pdf"
+        return result
+    except Exception as pdf_error:
+        logger.warning(
+            "PDF page %s file parse failed, trying page image: %s",
+            page_num,
+            pdf_error,
+        )
+
+    try:
+        png_bytes = render_pdf_page_png(file_bytes, page_index)
+        chunk_result = ask_openai_to_parse_image(
+            client,
+            f"{base_name}_page_{page_num}.png",
+            png_bytes,
+            chunk_prompt,
+        )
+        result["chunk_days"] = len(chunk_result.get("days", []))
+        result["chunk_result"] = chunk_result
+        result["parse_method"] = "image"
+        return result
+    except Exception as image_error:
+        logger.warning("PDF page %s image parse failed: %s", page_num, image_error)
+        result["warning"] = str(image_error)
+        return result
+
+
 def parse_pdf_document_stream(
     client: OpenAI,
     file_bytes: bytes,
@@ -645,94 +726,77 @@ def parse_pdf_document_stream(
     filename: str,
 ) -> Generator[dict, None, None]:
     """
-    Parse PDFs page-by-page: each page is sent as its own PDF to OpenAI
-    (layout/vision) without local text extraction.
+    Parse PDFs page-by-page in parallel batches; stream progress per completed page.
     """
     total_pages = count_pdf_pages(file_bytes)
     if total_pages == 0:
         raise ValueError("PDF has no pages")
 
+    workers = min(PDF_PAGE_PARALLELISM, total_pages)
     logger.info(
-        "Parsing PDF (%s pages) — one OpenAI file per page (no text extraction)",
+        "Parsing PDF (%s pages) — parallel workers=%s (one OpenAI file per page)",
         total_pages,
+        workers,
     )
     yield {"event": "start", "total_pages": total_pages}
 
     combined_by_date: dict[str, dict] = {}
+    merge_lock = threading.Lock()
     pdf_pages_parsed = 0
     vision_pages_parsed = 0
-    base_name = (filename or "document").rsplit(".", 1)[0]
 
-    for page_index in range(total_pages):
-        page_num = page_index + 1
-        chunk_prompt = (
-            system_prompt
-            + PAGE_CHUNK_SUFFIX
-            + f"\n(This chunk is page {page_num} of {total_pages}.)"
-        )
-        chunk_days = 0
-        parsed = False
-
-        try:
-            page_pdf = extract_single_page_pdf(file_bytes, page_index)
-            chunk_result = ask_openai_to_parse_pdf_bytes(
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(
+                _parse_pdf_page_index,
                 client,
-                f"{base_name}_page_{page_num}.pdf",
-                page_pdf,
-                chunk_prompt,
+                file_bytes,
+                system_prompt,
+                filename,
+                page_index,
+                total_pages,
             )
-            chunk_days = len(chunk_result.get("days", []))
-            merge_chunk_days(combined_by_date, chunk_result)
-            pdf_pages_parsed += 1
-            parsed = True
+            for page_index in range(total_pages)
+        ]
+
+        for future in as_completed(futures):
+            page_outcome = future.result()
+            page_num = page_outcome["page_num"]
+            chunk_days = page_outcome["chunk_days"]
+            chunk_result = page_outcome.get("chunk_result")
+            parse_method = page_outcome.get("parse_method")
+            warning = page_outcome.get("warning")
+
+            if chunk_result:
+                with merge_lock:
+                    merge_chunk_days(combined_by_date, chunk_result)
+                    total_days = len(combined_by_date)
+                if parse_method == "pdf":
+                    pdf_pages_parsed += 1
+                elif parse_method == "image":
+                    vision_pages_parsed += 1
+            else:
+                with merge_lock:
+                    total_days = len(combined_by_date)
+
             logger.info(
-                "PDF page %s file: chunk_days=%s total_unique=%s",
+                "PDF page %s %s: chunk_days=%s total_unique=%s",
                 page_num,
+                parse_method or "failed",
                 chunk_days,
-                len(combined_by_date),
-            )
-        except Exception as e:
-            logger.warning(
-                "PDF page %s file parse failed, trying page image: %s", page_num, e
+                total_days,
             )
 
-        if not parsed:
-            try:
-                png_bytes = render_pdf_page_png(file_bytes, page_index)
-                chunk_result = ask_openai_to_parse_image(
-                    client,
-                    f"{base_name}_page_{page_num}.png",
-                    png_bytes,
-                    chunk_prompt,
-                )
-                chunk_days = len(chunk_result.get("days", []))
-                merge_chunk_days(combined_by_date, chunk_result)
-                vision_pages_parsed += 1
-                logger.info(
-                    "PDF page %s image: chunk_days=%s total_unique=%s",
-                    page_num,
-                    chunk_days,
-                    len(combined_by_date),
-                )
-            except Exception as e:
-                logger.warning("PDF page %s image parse failed: %s", page_num, e)
-                yield {
-                    "event": "page",
-                    "page": page_num,
-                    "total_pages": total_pages,
-                    "chunk_days": 0,
-                    "total_days": len(combined_by_date),
-                    "warning": str(e),
-                }
-                continue
-
-        yield {
-            "event": "page",
-            "page": page_num,
-            "total_pages": total_pages,
-            "chunk_days": chunk_days,
-            "total_days": len(combined_by_date),
-        }
+            page_event: dict[str, Any] = {
+                "event": "page",
+                "page": page_num,
+                "total_pages": total_pages,
+                "chunk_days": chunk_days,
+                "total_days": total_days,
+            }
+            if warning:
+                page_event["warning"] = warning
+            yield page_event
 
     if combined_by_date:
         normalized_days = sorted(combined_by_date.values(), key=lambda x: x["date"])
@@ -969,7 +1033,14 @@ def run_import_pipeline(
 async def on_startup() -> None:
     port = os.getenv("PORT", "8000")
     key_present = bool(_openai_api_key())
-    logger.info("MEW Shifts import backend starting on port=%s openai_key_present=%s", port, key_present)
+    logger.info(
+        "MEW Shifts import backend starting on port=%s openai_key_present=%s "
+        "max_parallel_imports=%s pdf_page_parallelism=%s",
+        port,
+        key_present,
+        MAX_PARALLEL_IMPORTS,
+        PDF_PAGE_PARALLELISM,
+    )
     if not key_present:
         logger.error(
             "OPENAI_API_KEY is not set — /health will work but /import-attendance will return 503."
@@ -988,7 +1059,8 @@ def health() -> dict:
         "service": "mewshifts-import",
         "openai_key_present": bool(_openai_api_key()),
         "max_file_size_bytes": MAX_FILE_SIZE_BYTES,
-        "max_parallel_imports": 2,
+        "max_parallel_imports": MAX_PARALLEL_IMPORTS,
+        "pdf_page_parallelism": PDF_PAGE_PARALLELISM,
     }
 
 
