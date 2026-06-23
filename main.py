@@ -650,11 +650,30 @@ def parse_pdf_document(
     filename: str,
 ) -> dict:
     """Non-streaming wrapper around [parse_pdf_document_stream]."""
+    combined_by_date: dict[str, dict] = {}
     for event in parse_pdf_document_stream(
         client, file_bytes, system_prompt, filename
     ):
-        if event.get("event") == "done":
-            return {"days": event.get("days", [])}
+        if event.get("event") == "day":
+            day = event.get("day")
+            if isinstance(day, dict) and day.get("date"):
+                date_value = day["date"]
+                if date_value in combined_by_date:
+                    combined_by_date[date_value] = merge_day_dict(
+                        combined_by_date[date_value], day
+                    )
+                else:
+                    combined_by_date[date_value] = day
+        elif event.get("event") == "done":
+            if event.get("days"):
+                return {"days": event.get("days", [])}
+            if combined_by_date:
+                return {
+                    "days": sorted(
+                        combined_by_date.values(), key=lambda x: x["date"]
+                    )
+                }
+            return {"days": []}
     raise ValueError("PDF parse produced no result")
 
 
@@ -793,11 +812,13 @@ def parse_pdf_document_stream(
                 "chunk_days": chunk_days,
                 "total_days": total_days,
             }
-            if chunk_result:
-                page_event["days"] = chunk_result.get("days", [])
             if warning:
                 page_event["warning"] = warning
             yield page_event
+
+            if chunk_result:
+                for day in chunk_result.get("days", []):
+                    yield {"event": "day", "page": page_num, "day": day}
 
     if combined_by_date:
         normalized_days = sorted(combined_by_date.values(), key=lambda x: x["date"])
@@ -807,7 +828,7 @@ def parse_pdf_document_stream(
             pdf_pages_parsed,
             vision_pages_parsed,
         )
-        yield {"event": "done", "days": normalized_days}
+        yield {"event": "done", "total_days": len(normalized_days)}
         return
 
     logger.warning("PDF per-page parse found no rows; falling back to whole-file upload")
@@ -1165,7 +1186,7 @@ async def import_attendance(
                             logger.info(
                                 "Import stream complete for filename=%s | days_count=%s",
                                 filename,
-                                len(event.get("days", [])),
+                                event.get("total_days", len(event.get("days", []))),
                             )
                         yield json.dumps(event, ensure_ascii=False) + "\n"
                 finally:
