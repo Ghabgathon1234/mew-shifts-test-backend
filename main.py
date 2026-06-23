@@ -659,7 +659,6 @@ def parse_pdf_document(
 
 
 def _parse_pdf_page_index(
-    client: OpenAI,
     file_bytes: bytes,
     system_prompt: str,
     filename: str,
@@ -667,6 +666,7 @@ def _parse_pdf_page_index(
     total_pages: int,
 ) -> dict[str, Any]:
     """Parse one PDF page (single-page PDF upload, image fallback)."""
+    client = get_openai_client()
     page_num = page_index + 1
     base_name = (filename or "document").rsplit(".", 1)[0]
     chunk_prompt = (
@@ -749,7 +749,6 @@ def parse_pdf_document_stream(
         futures = [
             executor.submit(
                 _parse_pdf_page_index,
-                client,
                 file_bytes,
                 system_prompt,
                 filename,
@@ -794,6 +793,8 @@ def parse_pdf_document_stream(
                 "chunk_days": chunk_days,
                 "total_days": total_days,
             }
+            if chunk_result:
+                page_event["days"] = chunk_result.get("days", [])
             if warning:
                 page_event["warning"] = warning
             yield page_event
